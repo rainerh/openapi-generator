@@ -800,7 +800,12 @@ public abstract class AbstractJavaCodegen extends DefaultCodegen implements Code
                 }
             }
             return null;
+        } else if (ModelUtils.isObjectSchema(p)) {
+            if (!p.getNullable()) {
+                return "new " + getTypeDeclaration(p) + "()";
+            }
         }
+
         return super.toDefaultValue(p);
     }
 
