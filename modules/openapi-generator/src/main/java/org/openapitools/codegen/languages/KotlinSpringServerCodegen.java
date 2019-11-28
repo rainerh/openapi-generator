@@ -16,10 +16,13 @@
 
 package org.openapitools.codegen.languages;
 
-import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableMap.Builder;
 import com.samskivert.mustache.Mustache;
 import com.samskivert.mustache.Template;
+import com.samskivert.mustache.Mustache.Lambda;
+
 import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.oas.models.Operation;
 import io.swagger.v3.oas.models.media.Schema;
 import org.openapitools.codegen.*;
 import org.openapitools.codegen.languages.features.BeanValidationFeatures;
@@ -51,7 +54,6 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
             ));
 
     public static final String TITLE = "title";
-    public static final String LAMBDA = "lambda";
     public static final String SERVER_PORT = "serverPort";
     public static final String BASE_PACKAGE = "basePackage";
     public static final String SPRING_BOOT = "spring-boot";
@@ -62,6 +64,7 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
     public static final String SERVICE_IMPLEMENTATION = "serviceImplementation";
     public static final String REACTIVE = "reactive";
     public static final String INTERFACE_ONLY = "interfaceOnly";
+    public static final String DELEGATE_PATTERN = "delegatePattern";
 
     private String basePackage;
     private String invokerPackage;
@@ -76,6 +79,7 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
     private boolean serviceImplementation = false;
     private boolean reactive = false;
     private boolean interfaceOnly = false;
+    private boolean delegatePattern = false;
 
     public KotlinSpringServerCodegen() {
         super();
@@ -124,6 +128,7 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
         addSwitch(USE_BEANVALIDATION, "Use BeanValidation API annotations to validate data types", useBeanValidation);
         addSwitch(REACTIVE, "use coroutines for reactive behavior", reactive);
         addSwitch(INTERFACE_ONLY, "Whether to generate only API interface stubs without the server files.", interfaceOnly);
+        addSwitch(DELEGATE_PATTERN, "Whether to generate the server files using the delegate pattern", delegatePattern);
         supportedLibraries.put(SPRING_BOOT, "Spring-boot Server application.");
         setLibrary(SPRING_BOOT);
 
@@ -211,6 +216,10 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
 
     public void setInterfaceOnly(boolean interfaceOnly) {
         this.interfaceOnly = interfaceOnly;
+    }
+
+    public void setDelegatePattern(boolean delegatePattern) {
+        this.delegatePattern = delegatePattern;
     }
 
     @Override
@@ -330,13 +339,28 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
             this.setInterfaceOnly(Boolean.valueOf(additionalProperties.get(INTERFACE_ONLY).toString()));
         }
 
+        if (additionalProperties.containsKey(DELEGATE_PATTERN)) {
+            this.setDelegatePattern(Boolean.valueOf(additionalProperties.get(DELEGATE_PATTERN).toString()));
+            if (!this.interfaceOnly) {
+                this.setSwaggerAnnotations(true);
+            }
+        }
+
         modelTemplateFiles.put("model.mustache", ".kt");
 
-        if (interfaceOnly) {
+        if (!this.interfaceOnly && this.delegatePattern) {
+            apiTemplateFiles.put("apiInterface.mustache", ".kt");
+            apiTemplateFiles.put("apiController.mustache", "Controller.kt");
+        } else if (interfaceOnly) {
             apiTemplateFiles.put("apiInterface.mustache", ".kt");
         } else {
             apiTemplateFiles.put("api.mustache", ".kt");
             apiTestTemplateFiles.put("api_test.mustache", ".kt");
+        }
+
+        if (SPRING_BOOT.equals(library)) {
+            supportingFiles.add(new SupportingFile("apiUtil.mustache",
+                    (sourceFolder + File.separator + apiPackage).replace(".", java.io.File.separator), "ApiUtil.kt"));
         }
 
         if (this.serviceInterface) {
@@ -346,6 +370,11 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
             additionalProperties.put(SERVICE_INTERFACE, true);
             apiTemplateFiles.put("service.mustache", "Service.kt");
             apiTemplateFiles.put("serviceImpl.mustache", "ServiceImpl.kt");
+        }
+
+        if (this.delegatePattern) {
+            additionalProperties.put("isDelegate", "true");
+            apiTemplateFiles.put("apiDelegate.mustache", "Delegate.kt");
         }
 
         supportingFiles.add(new SupportingFile("README.mustache", "", "README.md"));
@@ -370,22 +399,45 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
                     sanitizeDirectory(sourceFolder + File.separator + basePackage), "Application.kt"));
         }
 
-        addMustacheLambdas(additionalProperties);
-
         // spring uses the jackson lib, and we disallow configuration.
         additionalProperties.put("jackson", "true");
+
+        // add lambda for mustache templates
+        additionalProperties.put("lambdaEscapeDoubleQuote",
+                (Mustache.Lambda) (fragment, writer) -> writer.write(fragment.execute().replaceAll("\"", Matcher.quoteReplacement("\\\""))));
+        additionalProperties.put("lambdaRemoveLineBreak",
+                (Mustache.Lambda) (fragment, writer) -> writer.write(fragment.execute().replaceAll("\\r|\\n", "")));
     }
 
-    private void addMustacheLambdas(final Map<String, Object> objs) {
-        Map<String, Mustache.Lambda> lambdas =
-                new ImmutableMap.Builder<String, Mustache.Lambda>()
-                        .put("escapeDoubleQuote", new EscapeLambda("\"", "\\\""))
-                        .build();
+    @Override
+    protected Builder<String, Lambda> addMustacheLambdas() {
+        return super.addMustacheLambdas()
+                .put("escapeDoubleQuote", new EscapeLambda("\"", "\\\""));
+    }
 
-        if (objs.containsKey(LAMBDA)) {
-            LOGGER.warn("The lambda property is a reserved word, and will be overwritten!");
+    @Override
+    public void addOperationToGroup(String tag, String resourcePath, Operation operation, CodegenOperation co, Map<String, List<CodegenOperation>> operations) {
+        if (library.equals(SPRING_BOOT) && this.delegatePattern) {
+            String basePath = resourcePath;
+            if (basePath.startsWith("/")) {
+                basePath = basePath.substring(1);
+            }
+            int pos = basePath.indexOf("/");
+            if (pos > 0) {
+                basePath = basePath.substring(0, pos);
+            }
+
+            if (basePath.equals("")) {
+                basePath = "default";
+            } else {
+                co.subresourceOperation = !co.path.isEmpty();
+            }
+            List<CodegenOperation> opList = operations.computeIfAbsent(basePath, k -> new ArrayList<>());
+            opList.add(co);
+            co.baseName = basePath;
+        } else {
+            super.addOperationToGroup(tag, resourcePath, operation, co, operations);
         }
-        objs.put(LAMBDA, lambdas);
     }
 
     @Override
@@ -414,7 +466,7 @@ public class KotlinSpringServerCodegen extends AbstractKotlinCodegen
         }
 
         if (!additionalProperties.containsKey(SERVER_PORT)) {
-            URL url = URLPathUtils.getServerURL(openAPI);
+            URL url = URLPathUtils.getServerURL(openAPI, serverVariableOverrides());
             this.additionalProperties.put(SERVER_PORT, URLPathUtils.getPort(url, 8080));
         }
 
